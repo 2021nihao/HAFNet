@@ -1,5 +1,5 @@
 # HAFNet <br>
-## Result_predict_images  <br>
+
 # Prediction results and comparison graphs for the test dataset
 link: https://pan.baidu.com/s/1ZuKixGrEsfJ-2OnQeFEfpg?pwd=gs64 code: gs64
 # Weights of the model
