@@ -1,8 +1,70 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+# from backbone.mobilenetv2 import mobilenet_v2
+# from toolbox.models.bbbmodels.mobilenetv2 import mobilenet_v2
+# from backbone.VGG import VGG16
+# from backbone.resnet import Backbone_ResNet34_in3
+from torchvision import transforms
+import cv2
+from backbone.convnext import convnext_small
 
-from toolbox.backbone.convnext import convnext_small
+###------------------------------DFM1--加入d=18的膨胀卷积--将d4（DAM输出）加入到末尾concat---------------------
+
+class Encoder(nn.Module):
+    def __init__(self):
+        super(Encoder, self).__init__()
+        rgb = convnext_small(True)
+        t = convnext_small(True)
+        self.layer0_r = nn.Sequential(rgb.downsample_layers[0], rgb.stages[0])
+        self.layer1_r = nn.Sequential(rgb.downsample_layers[1], rgb.stages[1])
+        self.layer2_r = nn.Sequential(rgb.downsample_layers[2], rgb.stages[2])
+        self.layer3_r = nn.Sequential(rgb.downsample_layers[3], rgb.stages[3])
+
+        self.layer0_t = nn.Sequential(t.downsample_layers[0], t.stages[0])
+        self.layer1_t = nn.Sequential(t.downsample_layers[1], t.stages[1])
+        self.layer2_t = nn.Sequential(t.downsample_layers[2], t.stages[2])
+        self.layer3_t = nn.Sequential(t.downsample_layers[3], t.stages[3])
+
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7, ):
+        super(SpatialAttention, self).__init__()
+
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+
+        self.conv1 = nn.Conv2d(2 , 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)    #1*h*w
+
+class ChannelAttention(nn.Module):
+    # def __init__(self, in_planes, ratio=16):
+    def __init__(self, in_planes, ratio=8):
+        super(ChannelAttention, self).__init__()
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        # self.fc1 = nn.Conv2d(in_planes, in_planes / 16, 1, bias=False)
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.LeakyReLU()
+        # self.fc2 = nn.Conv2d(in_planes / 16, in_planes, 1, bias=False)
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self,x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)   #输出格式为 1*1*c
 
 class ChannelShuffle(nn.Module):
     def __init__(self, groups):
@@ -126,14 +188,12 @@ class MDA(nn.Module):
 
         self.conv_w1 = nn.Conv2d(128, 128, 1, 1)
         self.conv_w2 = nn.Conv2d(128, 128, 1, 1)
-
+        # self.resize = nn.UpsamplingBilinear2d((13, 13))
 
     def forward(self, r, t, d4):
         r3 = self.d3_r(r)  # 128
-        # print(r3.shape)
         r_13 = torch.cat([r, r3], dim=1)  # 640
         r6 = self.d6_r(r_13)  # 128
-        # print(r6.shape)
         r_136 = torch.cat([r_13, r6], dim=1)  # 768
         r12 = self.d12_r(r_136)  # 128
         cat_r = torch.cat([r, r3, r6, r12], dim=1)  # 896
@@ -188,7 +248,8 @@ class NAE(nn.Module):
         self.up2x = nn.UpsamplingBilinear2d(scale_factor=2)
         self.up4x = nn.UpsamplingBilinear2d(scale_factor=4)
         self.up8x = nn.UpsamplingBilinear2d(scale_factor=8)
-
+        # self.mp = nn.MaxPool2d(1)
+        # self.avp = nn.AdaptiveAvgPool2d(1)
         self.conv_att_x1 = nn.Conv2d(2, 1, 1, 1)
         self.conv_att_x3 = nn.Conv2d(2, 1, 1, 1)
         self.conv_fus = nn.Sequential(nn.Conv2d(in_channels=384, out_channels=128, kernel_size=1, stride=1, padding=0),
@@ -207,6 +268,8 @@ class NAE(nn.Module):
         cat_x1 = torch.cat([x1_max, x1_mean], dim=1)
         cat_x1 = self.up4x(cat_x1)
         att_x1 = torch.sigmoid(self.conv_att_x1(cat_x1))
+        # we_3avp = self.avp(x3)
+        # we_3mp = self.mp(x3)
         x3_mean = torch.mean(conv_x3, dim=1, keepdim=True)
         x3_max,_ = torch.max(conv_x3, dim=1, keepdim=True)
         cat_x3 = torch.cat([x3_max, x3_mean], dim=1)
@@ -297,6 +360,9 @@ class HAFNet(nn.Module):
     def __init__(self):
         super(HAFNet,self).__init__()
 
+        # self.mobile_rgb = mobilenet_v2(pretrained=True)
+        # self.mobile_dep = mobilenet_v2(pretrained=True)
+
         self.reshape1 = nn.Conv2d(96, 96, 3, stride=2, padding=1)
         self.reshape2 = nn.Conv2d(96, 192, 3, stride=2, padding=1)
         self.reshape3 = nn.Conv2d(192, 384, 3, stride=2, padding=1)
@@ -314,7 +380,7 @@ class HAFNet(nn.Module):
         self.up32x = nn.UpsamplingBilinear2d(scale_factor=32)
 
         self.conv1 = nn.Conv2d(in_channels=512, out_channels=64, kernel_size=1)
-
+        # self.dfm = DFM()
         self.MDA = MDA()
 
         self.NAE1 = NAE(in_ch1=128, in_ch2=384, in_ch3=192)
@@ -329,7 +395,6 @@ class HAFNet(nn.Module):
         self.conv_out3 = nn.Conv2d(in_channels=128, out_channels=1, kernel_size=1)
 
         self.conv_out4 = nn.Conv2d(in_channels=128, out_channels=1, kernel_size=1)
-
 
         rgb = convnext_small(True)
         t = convnext_small(True)
@@ -347,12 +412,10 @@ class HAFNet(nn.Module):
 
 
     def forward(self, img, depth):
-
         conv1_convnext_r = self.layer0_r(img)
         conv1_convnext_t = self.layer0_t(depth)
 
         fus1 = self.CFI1(conv1_convnext_r, conv1_convnext_t, conv1_convnext_t + conv1_convnext_r)
-
         cfus1_r = fus1 + conv1_convnext_r
         cfus1_t = fus1 + conv1_convnext_t
         fus1 = self.up2x(fus1)
@@ -370,7 +433,9 @@ class HAFNet(nn.Module):
 
         conv3_convnext_r = self.layer2_r(conv2_convnext_r)
         conv3_convnext_t = self.layer2_t(cfus2_t)
-
+        # print(conv3_convnext_r.shape, conv3_convnext_t.shape)
+        # conv3_convnext_r = self.layer2_r(cfus2_r)
+        # conv3_convnext_t = self.layer2_t(conv2_convnext_t)
         fus3 = self.CFI3(conv3_convnext_r, conv3_convnext_t, fus2_reshape)
         # print(fus3.shape)
         cfus3_r = fus3 + conv3_convnext_r
@@ -380,22 +445,28 @@ class HAFNet(nn.Module):
 
         conv4_convnext_r = self.layer3_r(cfus3_r)
         conv4_convnext_t = self.layer3_t(conv3_convnext_t)
-
+        # print(conv4_convnext_r.shape, conv4_convnext_t.shape)
+        # conv4_convnext_r = self.layer3_r(conv3_convnext_r)
+        # conv4_convnext_t = self.layer3_t(cfus3_t)
         fus4 = self.CFI4(conv4_convnext_r, conv4_convnext_t, fus3_reshape)
         # print(fus4.shape)
         cfus4_r = fus4 + conv4_convnext_r
         cfus4_t = fus4 + conv4_convnext_t
 
+        # fus4_reshape = self.reshape4(fus4)
+        #
+        # conv5_mobile_r = self.mobile_rgb.features[14:18](cfus4_r)
+        # conv5_mobile_t = self.mobile_dep.features[14:18](conv4_mobile_t)
         conv5_convnext_r = self.layer4_r(cfus4_r)
         conv5_convnext_t = self.layer4_t(conv4_convnext_t)
-
+        # print(conv5_convnext_r.shape, conv5_convnext_t.shape, fus4.shape)
+        # conv5_convnext_r = self.layer4_r(conv4_convnext_r)
+        # conv5_convnext_t = self.layer4_t(cfus4_t)
         out1 = self.MDA(conv5_convnext_r, conv5_convnext_t, fus4)
-
         out2 = self.NAE1(out1, fus4, fus3)
         out3 = self.NAE2(fus4, fus3, fus2)
         out4 = self.NAE3(fus3, fus2, fus1)
 
-        # print(out2.shape, out3.shape, out4.shape)
         out = self.CCF(out2, out3, out4)
         out = self.up2x(out)
         out4 = self.up2x(self.conv_out4(out4))
